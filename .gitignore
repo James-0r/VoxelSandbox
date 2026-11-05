@@ -76,3 +76,5 @@ DerivedDataCache/*
 # Private notes, not part of the submission
 CLAUDE.md
 docs/
+.mcp.json
+.claude/
