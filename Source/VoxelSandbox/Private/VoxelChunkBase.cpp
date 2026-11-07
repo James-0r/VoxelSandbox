@@ -71,41 +71,100 @@ void AVoxelChunkBase::FillColumns()
 	}
 }
 
-void AVoxelChunkBase::CarveCaves(const FVector NoiseOffset, const double CaveFrequency, const double TunnelWidth,
-	const int32 BedrockLayers, const int32 GrassDepthMax, UCurveFloat* CaveCurve)
+namespace
 {
-	// Ported 1:1 from the Blueprint, including its double math and the float casts into Perlin,
-	// so the same seed carves exactly the same cells.
+	// Per-noise offsets in cube units, added on top of the seed's NoiseOffset so the four noise fields are
+	// independent and nothing lines up with anything else. Chosen so offset × frequency never lands on a
+	// multiple of 256 (Perlin's repeat period), which would make two fields identical.
+
+	/** Offset for the cheese caverns noise. */
+	const FVector CheeseNoiseOffset(-3000.0, 0.0, 0.0);
+
+	/** Offset for tunnel noise A. */
+	const FVector TunnelNoiseOffsetA(1000.0, 0.0, 0.0);
+
+	/** Offset for tunnel noise B. */
+	const FVector TunnelNoiseOffsetB(0.0, 2000.0, 0.0);
+
+	/** Offset for the tunnel width noise. */
+	const FVector TunnelWidthNoiseOffset(0.0, 0.0, 3000.0);
+
+	/**
+	 * Width noise range mapped to TunnelWidthMin..Max. Perlin output sits mostly within ±0.5, so mapping
+	 * that span (clamped) uses the whole width range instead of hovering in the middle.
+	 */
+	constexpr double TunnelWidthNoiseRange = 0.5;
+
+	/** Samples 3D Perlin at (Position + Offset) × Frequency, with Z frequency multiplied by ZScale. */
+	float SampleCaveNoise(const FVector& Position, const FVector& Offset, const double Frequency, const double ZScale = 1.0)
+	{
+		return UVoxelNoiseLibrary::PerlinNoise3D(
+			static_cast<float>((Position.X + Offset.X) * Frequency),
+			static_cast<float>((Position.Y + Offset.Y) * Frequency),
+			static_cast<float>((Position.Z + Offset.Z) * Frequency * ZScale));
+	}
+}
+
+void AVoxelChunkBase::CarveCaves(const FVector NoiseOffset, const FVoxelCaveSettings& Caves, const int32 BedrockLayers,
+	const int32 GrassDepthMax)
+{
+	// Cheese: one noise above a depth curve gives big blobs. Tunnels: two independent noises are each near zero
+	// on a thin wavy sheet; where both sheets cross is a line, and "both within Width" thickens it into a tube.
 	TRACE_CPUPROFILER_EVENT_SCOPE(AVoxelChunkBase::CarveCaves);
 
 	check(Cubes.Num() == Voxel::ColumnCount * WorldHeight);
 	check(Heights.Num() == Voxel::ColumnCount);
-	ensureMsgf(CaveCurve != nullptr, TEXT("CarveCaves: CaveCurve is not set; treating the threshold as 0."));
+	ensureMsgf(Caves.CaveCurve != nullptr, TEXT("CarveCaves: CaveCurve is not set; treating the cheese threshold as 0."));
+	ensureMsgf(Caves.TunnelWidthMin <= Caves.TunnelWidthMax, TEXT("CarveCaves: TunnelWidthMin (%f) is above TunnelWidthMax (%f)."),
+		Caves.TunnelWidthMin, Caves.TunnelWidthMax);
+
+	// No tunnel can be wider than this, so cells where |A| or |B| exceed it skip the remaining noise samples.
+	const double WidestTunnel = FMath::Max(Caves.TunnelWidthMin, Caves.TunnelWidthMax);
 
 	for (int32 X = 0; X < Voxel::ChunkSize; ++X)
 	{
-		const double WorldX = static_cast<double>(Voxel::ChunkSize * ChunkCoord.X + X);
+		const double SampleX = static_cast<double>(Voxel::ChunkSize * ChunkCoord.X + X) + NoiseOffset.X;
 
 		for (int32 Y = 0; Y < Voxel::ChunkSize; ++Y)
 		{
-			const double WorldY = static_cast<double>(Voxel::ChunkSize * ChunkCoord.Y + Y);
+			const double SampleY = static_cast<double>(Voxel::ChunkSize * ChunkCoord.Y + Y) + NoiseOffset.Y;
 			const int32 Height = Heights[ColumnIndex(X, Y)];
 			const int32 LastZ = Height - GrassDepthMax;
 
 			for (int32 Z = BedrockLayers; Z <= LastZ; ++Z)
 			{
-				const float Noise = UVoxelNoiseLibrary::PerlinNoise3D(
-					static_cast<float>(CaveFrequency * (WorldX + NoiseOffset.X)),
-					static_cast<float>(CaveFrequency * (NoiseOffset.Y + WorldY)),
-					static_cast<float>(CaveFrequency * (NoiseOffset.Z + static_cast<double>(Z))));
+				const FVector Position(SampleX, SampleY, static_cast<double>(Z) + NoiseOffset.Z);
 
+				// Cheese caverns.
 				const float DepthFraction = static_cast<float>(static_cast<double>(Z) / static_cast<double>(Height));
-				const double CheeseThreshold = CaveCurve ? static_cast<double>(CaveCurve->GetFloatValue(DepthFraction)) : 0.0;
+				const double CheeseThreshold = Caves.CaveCurve ? static_cast<double>(Caves.CaveCurve->GetFloatValue(DepthFraction)) : 0.0;
+				const double Cheese = SampleCaveNoise(Position, CheeseNoiseOffset, Caves.CheeseFrequency);
+				if (Cheese > CheeseThreshold)
+				{
+					Cubes[CubeIndex(X, Y, Z)] = Voxel::CubeType::Air;
+					continue;
+				}
 
-				const bool bIsTunnel = FMath::Abs(static_cast<double>(Noise)) < TunnelWidth;
-				const bool bIsCheese = static_cast<double>(Noise) > CheeseThreshold;
+				// Tunnels: both sheet noises must be near zero.
+				const double TunnelA = FMath::Abs(SampleCaveNoise(Position, TunnelNoiseOffsetA, Caves.TunnelFrequency, Caves.TunnelVerticalScale));
+				if (TunnelA >= WidestTunnel)
+				{
+					continue;
+				}
+				const double TunnelB = FMath::Abs(SampleCaveNoise(Position, TunnelNoiseOffsetB, Caves.TunnelFrequency, Caves.TunnelVerticalScale));
+				if (TunnelB >= WidestTunnel)
+				{
+					continue;
+				}
 
-				if (bIsTunnel || bIsCheese)
+				// Width varies slowly along the tunnel.
+				const double WidthNoise = SampleCaveNoise(Position, TunnelWidthNoiseOffset, Caves.TunnelWidthFrequency);
+				const double Width = FMath::GetMappedRangeValueClamped(
+					FVector2D(-TunnelWidthNoiseRange, TunnelWidthNoiseRange),
+					FVector2D(Caves.TunnelWidthMin, Caves.TunnelWidthMax),
+					WidthNoise);
+
+				if (TunnelA < Width && TunnelB < Width)
 				{
 					Cubes[CubeIndex(X, Y, Z)] = Voxel::CubeType::Air;
 				}

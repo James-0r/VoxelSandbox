@@ -4,10 +4,10 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "VoxelCaveSettings.h"
 #include "VoxelChunkBase.generated.h"
 
 class AVoxelWorldBase;
-class UCurveFloat;
 
 /**
  * C++ base for BP_VoxelChunk: owns the cube data and runs the per-cell loops
@@ -34,11 +34,11 @@ public:
 	void FillColumns();
 
 	/**
-	 * Carves cheese caves and thin tunnels with 3D noise, the same way the Blueprint did:
-	 * Z from BedrockLayers to (Height − GrassDepthMax), carve when |N| < TunnelWidth or N > CaveCurve(Z / Height).
+	 * Carves cheese caverns (one noise above CaveCurve) and round tunnels (two noises both near zero, with a
+	 * width that varies along the tunnel). Z runs from BedrockLayers to (Height − GrassDepthMax). Deterministic per seed.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Chunk")
-	void CarveCaves(FVector NoiseOffset, double CaveFrequency, double TunnelWidth, int32 BedrockLayers, int32 GrassDepthMax, UCurveFloat* CaveCurve);
+	void CarveCaves(FVector NoiseOffset, const FVoxelCaveSettings& Caves, int32 BedrockLayers, int32 GrassDepthMax);
 
 	/**
 	 * Builds the mesh arrays for one cube type with face culling. Outputs plug straight into Create Mesh Section.
