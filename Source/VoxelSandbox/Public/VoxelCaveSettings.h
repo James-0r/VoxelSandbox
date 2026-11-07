@@ -43,4 +43,12 @@ struct VOXELSANDBOX_API FVoxelCaveSettings
 	/** Multiplies the tunnel noise frequency in Z. Above 1 = flatter tunnels that run more horizontally. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves|Tunnels", meta = (ClampMin = "0.0", ToolTip = "Multiplies the tunnel noise frequency in Z. 2 = tunnels about half as tall as wide and mostly horizontal; 1 = round and free to go up or down."))
 	double TunnelVerticalScale = 2.0;
+
+	/** No carving closer than this many cubes to the surface, measured against the lowest surface nearby. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves|Surface", meta = (ClampMin = "0", ToolTip = "Minimum solid cubes between a cave and the surface. Measured down from the lowest column top within SurfaceMargin + SurfaceFade columns (neighbour chunks included), so hillsides and cliffs keep a thick wall too. Higher = caves sit deeper and never break out."))
+	int32 SurfaceMargin = 4;
+
+	/** Over this many cubes beyond SurfaceMargin, caves ease in: cheese needs a higher threshold and tunnels are narrower. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves|Surface", meta = (ClampMin = "0", ToolTip = "Soft band below the margin, in cubes. Cheese caverns need a stronger noise and tunnels shrink, both blending to normal at SurfaceMargin + SurfaceFade. 0 = hard cut at the margin. It also widens the sideways search radius."))
+	int32 SurfaceFade = 4;
 };

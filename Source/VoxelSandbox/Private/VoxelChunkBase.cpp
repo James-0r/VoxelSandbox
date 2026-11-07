@@ -95,6 +95,15 @@ namespace
 	 */
 	constexpr double TunnelWidthNoiseRange = 0.5;
 
+	/**
+	 * Cheese threshold at the inner edge of the surface fade. Perlin output stays below ~1, so a threshold of 1
+	 * means "no cheese"; the fade blends from this down to the normal CaveCurve threshold.
+	 */
+	constexpr double CheeseThresholdAtMargin = 1.0;
+
+	/** Marks a padded-grid column whose chunk doesn't exist (world rim); such columns are skipped. */
+	constexpr int32 MissingColumnHeight = TNumericLimits<int32>::Max();
+
 	/** Samples 3D Perlin at (Position + Offset) × Frequency, with Z frequency multiplied by ZScale. */
 	float SampleCaveNoise(const FVector& Position, const FVector& Offset, const double Frequency, const double ZScale = 1.0)
 	{
@@ -121,6 +130,13 @@ void AVoxelChunkBase::CarveCaves(const FVector NoiseOffset, const FVoxelCaveSett
 	// No tunnel can be wider than this, so cells where |A| or |B| exceed it skip the remaining noise samples.
 	const double WidestTunnel = FMath::Max(Caves.TunnelWidthMin, Caves.TunnelWidthMax);
 
+	// Surface margin: clearance is measured down from the lowest surface within this many columns, so a
+	// cell beside a cliff counts the open air next to it, not just the sky straight above.
+	const int32 SurfaceMargin = FMath::Max(Caves.SurfaceMargin, 0);
+	const int32 SurfaceFade = FMath::Max(Caves.SurfaceFade, 0);
+	TArray<int32> LowestNearby;
+	ComputeLowestNearbyHeights(SurfaceMargin + SurfaceFade, LowestNearby);
+
 	for (int32 X = 0; X < Voxel::ChunkSize; ++X)
 	{
 		const double SampleX = static_cast<double>(Voxel::ChunkSize * ChunkCoord.X + X) + NoiseOffset.X;
@@ -128,16 +144,27 @@ void AVoxelChunkBase::CarveCaves(const FVector NoiseOffset, const FVoxelCaveSett
 		for (int32 Y = 0; Y < Voxel::ChunkSize; ++Y)
 		{
 			const double SampleY = static_cast<double>(Voxel::ChunkSize * ChunkCoord.Y + Y) + NoiseOffset.Y;
-			const int32 Height = Heights[ColumnIndex(X, Y)];
-			const int32 LastZ = Height - GrassDepthMax;
+			const int32 Column = ColumnIndex(X, Y);
+			const int32 Height = Heights[Column];
+			const int32 SurfaceZ = FMath::Min(Height, LowestNearby[Column]);
+
+			// Existing depth rule, plus: no cell closer than SurfaceMargin to the nearby surface.
+			const int32 LastZ = FMath::Min(Height - GrassDepthMax, SurfaceZ - SurfaceMargin);
 
 			for (int32 Z = BedrockLayers; Z <= LastZ; ++Z)
 			{
 				const FVector Position(SampleX, SampleY, static_cast<double>(Z) + NoiseOffset.Z);
 
-				// Cheese caverns.
+				// Fade: 0 at the margin, 1 once the cell is SurfaceFade cubes deeper. Smoothstep avoids a visible step.
+				const int32 Clearance = SurfaceZ - Z;
+				const double FadeAlpha = SurfaceFade > 0
+					? FMath::SmoothStep(0.0, 1.0, static_cast<double>(Clearance - SurfaceMargin) / static_cast<double>(SurfaceFade))
+					: 1.0;
+
+				// Cheese caverns: the threshold is raised near the surface and blends back to the curve.
 				const float DepthFraction = static_cast<float>(static_cast<double>(Z) / static_cast<double>(Height));
-				const double CheeseThreshold = Caves.CaveCurve ? static_cast<double>(Caves.CaveCurve->GetFloatValue(DepthFraction)) : 0.0;
+				const double CurveThreshold = Caves.CaveCurve ? static_cast<double>(Caves.CaveCurve->GetFloatValue(DepthFraction)) : 0.0;
+				const double CheeseThreshold = FMath::Lerp(FMath::Max(CheeseThresholdAtMargin, CurveThreshold), CurveThreshold, FadeAlpha);
 				const double Cheese = SampleCaveNoise(Position, CheeseNoiseOffset, Caves.CheeseFrequency);
 				if (Cheese > CheeseThreshold)
 				{
@@ -157,9 +184,9 @@ void AVoxelChunkBase::CarveCaves(const FVector NoiseOffset, const FVoxelCaveSett
 					continue;
 				}
 
-				// Width varies slowly along the tunnel.
+				// Width varies slowly along the tunnel, and shrinks to nothing towards the surface margin.
 				const double WidthNoise = SampleCaveNoise(Position, TunnelWidthNoiseOffset, Caves.TunnelWidthFrequency);
-				const double Width = FMath::GetMappedRangeValueClamped(
+				const double Width = FadeAlpha * FMath::GetMappedRangeValueClamped(
 					FVector2D(-TunnelWidthNoiseRange, TunnelWidthNoiseRange),
 					FVector2D(Caves.TunnelWidthMin, Caves.TunnelWidthMax),
 					WidthNoise);
@@ -315,4 +342,73 @@ bool AVoxelChunkBase::IsAirAt(const int32 X, const int32 Y, const int32 Z) const
 		return VoxelWorld->GetCubeByte(WorldCell) == Voxel::CubeType::Air;
 	}
 	return true;
+}
+
+void AVoxelChunkBase::ComputeLowestNearbyHeights(const int32 Radius, TArray<int32>& OutLowest) const
+{
+	// Two passes: gather heights once into a grid padded by Radius on every side (one world lookup per
+	// column, not per cell), then take the minimum over a circle around each of this chunk's columns.
+	check(Heights.Num() == Voxel::ColumnCount);
+
+	const int32 PaddedSize = Voxel::ChunkSize + 2 * Radius;
+	TArray<int32> PaddedHeights;
+	PaddedHeights.SetNumUninitialized(PaddedSize * PaddedSize);
+
+	for (int32 PaddedY = 0; PaddedY < PaddedSize; ++PaddedY)
+	{
+		for (int32 PaddedX = 0; PaddedX < PaddedSize; ++PaddedX)
+		{
+			const int32 LocalX = PaddedX - Radius;
+			const int32 LocalY = PaddedY - Radius;
+			int32 ColumnHeight = MissingColumnHeight;
+
+			if (IsInsideColumns(LocalX, LocalY))
+			{
+				ColumnHeight = Heights[ColumnIndex(LocalX, LocalY)];
+			}
+			else if (VoxelWorld)
+			{
+				const FIntVector WorldCell(ChunkCoord.X * Voxel::ChunkSize + LocalX, ChunkCoord.Y * Voxel::ChunkSize + LocalY, 0);
+				if (const AVoxelChunkBase* Neighbour = VoxelWorld->FindChunk(AVoxelWorldBase::CellToChunkCoord(WorldCell)))
+				{
+					const FIntVector NeighbourLocal = AVoxelWorldBase::CellToLocal(WorldCell);
+					const int32 NeighbourHeight = Neighbour->GetColumnHeight(NeighbourLocal.X, NeighbourLocal.Y);
+					// INDEX_NONE = neighbour not initialised yet; treat it like a missing chunk.
+					if (NeighbourHeight != INDEX_NONE)
+					{
+						ColumnHeight = NeighbourHeight;
+					}
+				}
+			}
+
+			PaddedHeights[PaddedX + PaddedY * PaddedSize] = ColumnHeight;
+		}
+	}
+
+	OutLowest.SetNumUninitialized(Voxel::ColumnCount);
+	const int32 RadiusSquared = Radius * Radius;
+
+	for (int32 X = 0; X < Voxel::ChunkSize; ++X)
+	{
+		for (int32 Y = 0; Y < Voxel::ChunkSize; ++Y)
+		{
+			int32 Lowest = MissingColumnHeight;
+
+			for (int32 OffsetY = -Radius; OffsetY <= Radius; ++OffsetY)
+			{
+				for (int32 OffsetX = -Radius; OffsetX <= Radius; ++OffsetX)
+				{
+					if (OffsetX * OffsetX + OffsetY * OffsetY > RadiusSquared)
+					{
+						continue;
+					}
+					const int32 PaddedIndex = (X + Radius + OffsetX) + (Y + Radius + OffsetY) * PaddedSize;
+					Lowest = FMath::Min(Lowest, PaddedHeights[PaddedIndex]);
+				}
+			}
+
+			// The column itself is always inside the circle, so Lowest is never left as "missing".
+			OutLowest[ColumnIndex(X, Y)] = Lowest;
+		}
+	}
 }

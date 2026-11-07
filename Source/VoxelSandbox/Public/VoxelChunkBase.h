@@ -86,6 +86,12 @@ private:
 	/** Neighbour test for face culling: Z < 0 solid, Z >= WorldHeight air, outside X/Y via the world (Air if none). */
 	bool IsAirAt(int32 X, int32 Y, int32 Z) const;
 
+	/**
+	 * For each of this chunk's columns, the lowest column height within a horizontal circle of Radius columns,
+	 * including neighbour chunks through VoxelWorld. Missing chunks are ignored. Used for the cave surface margin.
+	 */
+	void ComputeLowestNearbyHeights(int32 Radius, TArray<int32>& OutLowest) const;
+
 	/** The world that registered this chunk; used for cross-chunk neighbour lookups. */
 	UPROPERTY(Transient)
 	TObjectPtr<AVoxelWorldBase> VoxelWorld;
