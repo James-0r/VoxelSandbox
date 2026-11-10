@@ -48,6 +48,22 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure = false, Category = "Voxel|Chunk")
 	void BuildSectionData(uint8 CubeType, double CubeSize, TArray<FVector>& Vertices, TArray<int32>& Triangles, TArray<FVector>& Normals, TArray<FVector2D>& UVs) const;
 
+	/**
+	 * Same inputs, outputs and air test as BuildSectionData, but merges neighbouring visible faces of this type
+	 * into the largest rectangles it can (greedy meshing). For each direction it sweeps the chunk slice by slice,
+	 * builds a 2D mask of visible faces, then grows each rectangle along its width first and then its height.
+	 * UVs run 0..Width and 0..Height so a texture would tile once per cube. Swap-in replacement for BuildSectionData.
+	 */
+	UFUNCTION(BlueprintCallable, BlueprintPure = false, Category = "Voxel|Chunk")
+	void BuildSectionDataGreedy(uint8 CubeType, double CubeSize, TArray<FVector>& Vertices, TArray<int32>& Triangles, TArray<FVector>& Normals, TArray<FVector2D>& UVs) const;
+
+	/**
+	 * Vertex and triangle count of the chunk's current mesh, summed over every section of its
+	 * Procedural Mesh Component. Call it after RebuildChunkMesh to compare the two meshers. 0, 0 if there is no mesh.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Voxel|Chunk|Debug")
+	void GetMeshStats(int32& VertexCount, int32& TriangleCount) const;
+
 	/** Returns the cube byte at a local cell, or Air when the cell is outside this chunk. */
 	UFUNCTION(BlueprintPure, Category = "Voxel|Chunk")
 	uint8 GetLocalCubeByte(int32 X, int32 Y, int32 Z) const;
@@ -85,6 +101,9 @@ private:
 
 	/** Neighbour test for face culling: Z < 0 solid, Z >= WorldHeight air, outside X/Y via the world (Air if none). */
 	bool IsAirAt(int32 X, int32 Y, int32 Z) const;
+
+	/** Highest column Height in this chunk. Every cell above it is Air, so the meshers can stop there. */
+	int32 GetTopFilledZ() const;
 
 	/**
 	 * For each of this chunk's columns, the lowest column height within a horizontal circle of Radius columns,
