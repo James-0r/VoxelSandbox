@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "VoxelCaveSettings.h"
 #include "VoxelWorldBase.generated.h"
 
 class AVoxelChunkBase;
@@ -39,6 +40,21 @@ public:
 	/** Local cell inside its chunk (X/Y in 0..ChunkSize−1, Z unchanged), so cell X −1 is local 15. */
 	UFUNCTION(BlueprintPure, Category = "Voxel|World")
 	static FIntVector CellToLocal(FIntVector Cell);
+
+	/**
+	 * Carves winding tunnels from the surface down until each one breaks into an existing cave, reaches bedrock,
+	 * leaves the loaded chunks or runs out of steps. Same Seed = same worms. Only writes cube bytes: no mesh
+	 * rebuild, no save record. Call after the caves pass and before ApplySavedChanges and meshing.
+	 * Outputs how many worms were carved and how many connected to a cave; also logs both and the time taken.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Voxel|World")
+	void CarveWorms(int32 Seed, const FVoxelWormSettings& Worms, int32 BedrockLayers, int32& WormsCarved, int32& WormsConnected);
+
+	/**
+	 * Writes a cube byte at a world cell through its chunk's SetLocalCubeByte. Doesn't rebuild any mesh or record
+	 * a save change (that's SetCube's job in Blueprint). False when the chunk doesn't exist or Z is out of range.
+	 */
+	bool SetCubeByte(FIntVector Cell, uint8 Type);
 
 private:
 	/** Floor division by ChunkSize, correct for negative values. */
