@@ -24,7 +24,7 @@ Blueprint-first: gameplay and feedback are Blueprints; C++ is used only for the 
 1. Unreal Engine **5.8.4** and **Visual Studio** with the *Game development with C++* workload.
 2. Clone the repo and open `VoxelSandbox.uproject`.
 3. When Unreal asks to rebuild the missing modules, click **Yes**.
-4. Open `Content/Voxel/Maps/L\_VoxelWorld` and press Play.
+4. Open `Content/Voxel/Maps/L\\\_VoxelWorld` and press Play.
 
 ## Controls
 
@@ -42,4 +42,6 @@ Blueprint-first: gameplay and feedback are Blueprints; C++ is used only for the 
 ## Copyright
 
 © 2026 Jaime Ortiz Rozalen. All rights reserved.
+
+Sounds: Kenney (kenney.nl), CC0
 
