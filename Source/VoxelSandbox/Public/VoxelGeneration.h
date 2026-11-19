@@ -89,7 +89,16 @@ namespace VoxelGeneration
 	/** Height noise at a world column: Octaves layers of Perlin, normalised to about -1..1. Port of SampleHeightNoise. */
 	double SampleHeightNoise(double WorldX, double WorldY, const FVoxelTerrainSettings& Terrain, const FVector& NoiseOffset);
 
-	/** Surface height of the world column (CellX, CellY): height noise → HeightCurve → clamped cube count. */
+	/**
+	 * How "mountain" the world column (CellX, CellY) is: 0 = plains, 1 = mountains, in between inside the blend band.
+	 * From a slow biome noise, so it changes smoothly across chunk borders.
+	 */
+	double SampleMountainWeight(int32 CellX, int32 CellY, const FVoxelTerrainSettings& Terrain, const FVector& NoiseOffset);
+
+	/**
+	 * Surface height of the world column (CellX, CellY): height noise → HeightCurve, blended with PlainsHeightCurve
+	 * by SampleMountainWeight when a plains curve is set → clamped cube count.
+	 */
 	int32 SampleColumnHeight(int32 CellX, int32 CellY, const FVoxelTerrainSettings& Terrain, const FVector& NoiseOffset, int32 WorldHeight);
 
 	/** Height, surface depth and snow line of the world column (CellX, CellY). Port of the GenerateTerrain column maths. */

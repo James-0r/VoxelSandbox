@@ -41,6 +41,9 @@ namespace
 	/** Offset for the tunnel width noise. */
 	const FVector TunnelWidthNoiseOffset(0.0, 0.0, 3000.0);
 
+	/** Offset (X, Y, in cubes) for the biome noise, so biomes don't line up with the height noise. */
+	const FVector2D BiomeNoiseOffset(5000.0, -7000.0);
+
 	/**
 	 * Width noise range mapped to TunnelWidthMin..Max. Perlin output sits mostly within ±0.5, so mapping
 	 * that span (clamped) uses the whole width range instead of hovering in the middle.
@@ -125,12 +128,36 @@ namespace VoxelGeneration
 		return Norm > 0.0 ? Sum / Norm : 0.0;
 	}
 
+	double SampleMountainWeight(const int32 CellX, const int32 CellY, const FVoxelTerrainSettings& Terrain, const FVector& NoiseOffset)
+	{
+		// One slow noise per column, eased across the blend band so heights mix without a seam. Per column, not per
+		// chunk: a per-chunk biome would put a cliff along every chunk border where two biomes meet.
+		const double BiomeNoise = SampleSurfaceNoise(static_cast<double>(CellX), NoiseOffset.X + BiomeNoiseOffset.X,
+			static_cast<double>(CellY), NoiseOffset.Y + BiomeNoiseOffset.Y, Terrain.BiomeFrequency);
+
+		if (Terrain.BiomeBlend <= 0.0)
+		{
+			return BiomeNoise >= Terrain.BiomeThreshold ? 1.0 : 0.0;
+		}
+		return FMath::SmoothStep(Terrain.BiomeThreshold - Terrain.BiomeBlend, Terrain.BiomeThreshold + Terrain.BiomeBlend, BiomeNoise);
+	}
+
 	int32 SampleColumnHeight(const int32 CellX, const int32 CellY, const FVoxelTerrainSettings& Terrain, const FVector& NoiseOffset,
 		const int32 WorldHeight)
 	{
-		// Noise → HeightCurve → fraction of WorldHeight, clamped so there's always a floor and a sky.
+		// Noise → height curve(s) → fraction of WorldHeight, clamped so there's always a floor and a sky.
+		// Both biome curves read the same height noise, so plains keep gentle bumps and rise smoothly into mountains.
 		const double HeightNoise = SampleHeightNoise(static_cast<double>(CellX), static_cast<double>(CellY), Terrain, NoiseOffset);
-		const double HeightFraction = Terrain.HeightCurve ? static_cast<double>(Terrain.HeightCurve->GetFloatValue(static_cast<float>(HeightNoise))) : 0.0;
+		const float CurveInput = static_cast<float>(HeightNoise);
+		const double MountainFraction = Terrain.HeightCurve ? static_cast<double>(Terrain.HeightCurve->GetFloatValue(CurveInput)) : 0.0;
+
+		double HeightFraction = MountainFraction;
+		if (Terrain.PlainsHeightCurve)
+		{
+			const double PlainsFraction = static_cast<double>(Terrain.PlainsHeightCurve->GetFloatValue(CurveInput));
+			HeightFraction = FMath::Lerp(PlainsFraction, MountainFraction, SampleMountainWeight(CellX, CellY, Terrain, NoiseOffset));
+		}
+
 		return FMath::Clamp(UKismetMathLibrary::Round(HeightFraction * WorldHeight), MinColumnHeight, WorldHeight - 1);
 	}
 

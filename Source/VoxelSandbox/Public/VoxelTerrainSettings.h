@@ -65,4 +65,20 @@ struct VOXELSANDBOX_API FVoxelTerrainSettings
 	/** How far the snow line moves up or down, in cubes. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Snow", meta = (ClampMin = "0", ToolTip = "How far the snow line moves up or down from its average, in cubes."))
 	int32 SnowLineVariation = 4;
+
+	/** Height curve for the plains biome. None = no biomes, the whole world uses HeightCurve. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Biomes", meta = (ToolTip = "Height curve for the plains biome: same input as HeightCurve (height noise, about -1..1), usually much flatter. None = no biomes, the whole world uses HeightCurve (mountains)."))
+	TObjectPtr<UCurveFloat> PlainsHeightCurve = nullptr;
+
+	/** Frequency of the biome noise (per cube). Lower = bigger biomes. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", ToolTip = "Frequency of the noise that picks mountains or plains (per cube). A biome is roughly 1 / frequency cubes across: 0.004 ≈ 250 cubes ≈ 15 chunks."))
+	double BiomeFrequency = 0.004;
+
+	/** Biome noise below this is plains, above it mountains. Higher = more plains. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Biomes", meta = (ToolTip = "Biome noise below this value is plains, above it mountains. 0 = about half and half; higher = more plains, lower = more mountains. Perlin stays within about ±0.6."))
+	double BiomeThreshold = 0.0;
+
+	/** Half-width of the transition between biomes, in biome noise units. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrain|Biomes", meta = (ClampMin = "0.0", ToolTip = "Half-width of the blend between plains and mountains, in biome noise units. Heights mix smoothly from Threshold − Blend to Threshold + Blend. Higher = wider, gentler foothills; 0 = a hard edge (cliffs)."))
+	double BiomeBlend = 0.1;
 };
