@@ -5,13 +5,16 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "VoxelCaveSettings.h"
+#include "VoxelGeneration.h"
+#include "VoxelTerrainSettings.h"
 #include "VoxelChunkBase.generated.h"
 
 class AVoxelWorldBase;
 
 /**
- * C++ base for BP_VoxelChunk: owns the cube data and runs the per-cell loops
- * (fill, caves, meshing). Per-column and per-chunk logic stays in Blueprint.
+ * C++ base for BP_VoxelChunk: owns the cube data and runs the per-cell loops (fill, caves, meshing).
+ * The generation maths itself lives in VoxelGeneration (pure functions); this class stores the result and
+ * draws it. Per-chunk logic stays in Blueprint.
  */
 UCLASS(Abstract)
 class VOXELSANDBOX_API AVoxelChunkBase : public AActor
@@ -25,9 +28,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Chunk")
 	void InitChunkData(FIntPoint InChunkCoord, int32 InWorldHeight);
 
-	/** Stores one column's surface height, grass depth and snow line, computed in Blueprint GenerateTerrain. */
+	/**
+	 * Computes this chunk's columns (height, surface depth, snow line) from the noise, plus a border of
+	 * neighbour columns as wide as the caves need, without reading any other chunk. Replaces the Blueprint
+	 * GenerateTerrain column loop. Call after InitChunkData, then FillColumns.
+	 */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Chunk")
-	void SetColumn(int32 X, int32 Y, int32 Height, int32 GrassDepth, int32 SnowLine);
+	void GenerateColumns(const FVoxelTerrainSettings& Terrain, const FVoxelCaveSettings& Caves, FVector NoiseOffset);
 
 	/** Fills every column from Z 0 to its Height using the GetTypeForCell rule (Rock / Grass / Snow). */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Chunk")
@@ -36,6 +43,8 @@ public:
 	/**
 	 * Carves cheese caverns (one noise above CaveCurve) and round tunnels (two noises both near zero, with a
 	 * width that varies along the tunnel). Z runs from BedrockLayers to (Height − GrassDepthMax). Deterministic per seed.
+	 * The surface margin uses the noise border from GenerateColumns, so neighbours don't need to be loaded.
+	 * Call after GenerateColumns and FillColumns.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Voxel|Chunk")
 	void CarveCaves(FVector NoiseOffset, const FVoxelCaveSettings& Caves, int32 BedrockLayers, int32 GrassDepthMax);
@@ -64,6 +73,10 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Voxel|Chunk|Debug")
 	void GetMeshStats(int32& VertexCount, int32& TriangleCount) const;
 
+	/** True once RebuildChunkMesh has created at least one mesh section (false again after Clear All Mesh Sections). */
+	UFUNCTION(BlueprintPure, Category = "Voxel|Chunk")
+	bool HasMesh() const;
+
 	/** Returns the cube byte at a local cell, or Air when the cell is outside this chunk. */
 	UFUNCTION(BlueprintPure, Category = "Voxel|Chunk")
 	uint8 GetLocalCubeByte(int32 X, int32 Y, int32 Z) const;
@@ -80,24 +93,18 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Voxel|Chunk")
 	FIntPoint GetChunkCoord() const { return ChunkCoord; }
 
+	/** Read-only access to the cube and column data, for C++ checks such as the world's generation test. */
+	const FVoxelChunkData& GetChunkData() const { return Data; }
+
+	/** Write access to the cube data for C++ generation passes (the world's worm carving). No mesh rebuild. */
+	FVoxelChunkData& GetMutableChunkData() { return Data; }
+
 	/** Called by AVoxelWorldBase::RegisterChunk so neighbour lookups can cross chunk borders. */
 	void SetVoxelWorld(AVoxelWorldBase* InWorld) { VoxelWorld = InWorld; }
 
 private:
-	/** Flat index of a local cell: X + Y*ChunkSize + Z*ChunkSize². Caller checks the range. */
-	static int32 CubeIndex(int32 X, int32 Y, int32 Z);
-
-	/** Flat index of a column: X + Y*ChunkSize. Caller checks the range. */
-	static int32 ColumnIndex(int32 X, int32 Y);
-
-	/** True when X and Y are inside the chunk (0..ChunkSize−1). */
-	static bool IsInsideColumns(int32 X, int32 Y);
-
 	/** True when the cell is inside the chunk in X, Y and Z. */
 	bool IsInsideChunk(int32 X, int32 Y, int32 Z) const;
-
-	/** GetTypeForCell rule: top TopDepth cubes are Snow if the surface reaches SnowLine, else Grass; below is Rock. */
-	static uint8 GetTypeForCell(int32 Z, int32 SurfaceZ, int32 TopDepth, int32 SnowLine);
 
 	/** Neighbour test for face culling: Z < 0 solid, Z >= WorldHeight air, outside X/Y via the world (Air if none). */
 	bool IsAirAt(int32 X, int32 Y, int32 Z) const;
@@ -105,33 +112,21 @@ private:
 	/** Highest column Height in this chunk. Every cell above it is Air, so the meshers can stop there. */
 	int32 GetTopFilledZ() const;
 
-	/**
-	 * For each of this chunk's columns, the lowest column height within a horizontal circle of Radius columns,
-	 * including neighbour chunks through VoxelWorld. Missing chunks are ignored. Used for the cave surface margin.
-	 */
-	void ComputeLowestNearbyHeights(int32 Radius, TArray<int32>& OutLowest) const;
-
 	/** The world that registered this chunk; used for cross-chunk neighbour lookups. */
 	UPROPERTY(Transient)
 	TObjectPtr<AVoxelWorldBase> VoxelWorld;
 
 	// Plain C++ data (not UPROPERTY) so names can't clash with the Blueprint's own variables.
 
-	/** Cube bytes, Index = X + Y*ChunkSize + Z*ChunkSize². */
-	TArray<uint8> Cubes;
+	/** Cubes and columns of this chunk. */
+	FVoxelChunkData Data;
 
-	/** Top filled Z per column, Index = X + Y*ChunkSize. */
-	TArray<int32> Heights;
+	/** Heights of this chunk's columns plus PaddedColumns on every side, from GenerateColumns. */
+	TArray<int32> PaddedHeights;
 
-	/** Surface layer depth per column. */
-	TArray<int32> GrassDepths;
-
-	/** Snow line per column. */
-	TArray<int32> SnowLines;
+	/** Border width of PaddedHeights, in columns. */
+	int32 PaddedColumns = 0;
 
 	/** This chunk's coordinate in the chunk grid. */
 	FIntPoint ChunkCoord = FIntPoint::ZeroValue;
-
-	/** Number of cube layers in Z. */
-	int32 WorldHeight = 0;
 };

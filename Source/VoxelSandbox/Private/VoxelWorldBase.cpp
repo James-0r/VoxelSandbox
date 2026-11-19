@@ -5,7 +5,7 @@
 #include "HAL/PlatformTime.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelChunkBase.h"
-#include "VoxelNoiseLibrary.h"
+#include "VoxelGeneration.h"
 #include "VoxelLog.h"
 #include "VoxelTypes.h"
 
@@ -72,274 +72,458 @@ int32 AVoxelWorldBase::FloorDivChunk(const int32 Value)
 	return Value >= 0 ? Value / Voxel::ChunkSize : -((-Value + Voxel::ChunkSize - 1) / Voxel::ChunkSize);
 }
 
-bool AVoxelWorldBase::SetCubeByte(const FIntVector Cell, const uint8 Type)
+namespace
 {
-	// Raw write for generation passes: the Blueprint SetCube adds the mesh rebuild and the save record on top.
-	AVoxelChunkBase* Chunk = FindChunk(CellToChunkCoord(Cell));
-	if (!Chunk)
+	/**
+	 * Every chunk coordinate within Radius of Center (a circle), nearest first. Ties are broken by X then Y so
+	 * the order never depends on anything but the inputs.
+	 */
+	TArray<FIntPoint> GetCoordsNearestFirst(const FIntPoint Center, const int32 Radius)
 	{
-		return false;
+		const int32 SafeRadius = FMath::Max(Radius, 0);
+		const int32 RadiusSquared = SafeRadius * SafeRadius;
+
+		TArray<FIntPoint> Offsets;
+		for (int32 OffsetY = -SafeRadius; OffsetY <= SafeRadius; ++OffsetY)
+		{
+			for (int32 OffsetX = -SafeRadius; OffsetX <= SafeRadius; ++OffsetX)
+			{
+				if (OffsetX * OffsetX + OffsetY * OffsetY <= RadiusSquared)
+				{
+					Offsets.Add(FIntPoint(OffsetX, OffsetY));
+				}
+			}
+		}
+
+		Offsets.Sort([](const FIntPoint& A, const FIntPoint& B)
+		{
+			const int32 DistanceA = A.X * A.X + A.Y * A.Y;
+			const int32 DistanceB = B.X * B.X + B.Y * B.Y;
+			if (DistanceA != DistanceB)
+			{
+				return DistanceA < DistanceB;
+			}
+			return A.X != B.X ? A.X < B.X : A.Y < B.Y;
+		});
+
+		for (FIntPoint& Offset : Offsets)
+		{
+			Offset += Center;
+		}
+		return Offsets;
 	}
 
-	const FIntVector Local = CellToLocal(Cell);
-	return Chunk->SetLocalCubeByte(Local.X, Local.Y, Local.Z, Type);
+	/** True when Count has reached a MaxCount limit (0 or less = no limit). */
+	bool IsAtLimit(const int32 Count, const int32 MaxCount)
+	{
+		return MaxCount > 0 && Count >= MaxCount;
+	}
+}
+
+TArray<FIntPoint> AVoxelWorldBase::GetMissingChunksNear(const FIntPoint Center, const int32 RadiusChunks, const int32 MaxCount) const
+{
+	// Walk the circle from the centre outwards and keep the holes, so the closest ground always loads first.
+	TArray<FIntPoint> Missing;
+	for (const FIntPoint& Coord : GetCoordsNearestFirst(Center, RadiusChunks))
+	{
+		if (IsAtLimit(Missing.Num(), MaxCount))
+		{
+			break;
+		}
+		if (!Chunks.Contains(Coord))
+		{
+			Missing.Add(Coord);
+		}
+	}
+	return Missing;
+}
+
+TArray<AVoxelChunkBase*> AVoxelWorldBase::GetChunksReadyToMesh(const FIntPoint Center, const int32 RadiusChunks, const int32 MaxCount) const
+{
+	// A chunk's mesh culls its border faces against the four side neighbours, so wait until they all exist.
+	static const FIntPoint SideOffsets[] = { FIntPoint(1, 0), FIntPoint(-1, 0), FIntPoint(0, 1), FIntPoint(0, -1) };
+
+	TArray<AVoxelChunkBase*> Ready;
+	for (const FIntPoint& Coord : GetCoordsNearestFirst(Center, RadiusChunks))
+	{
+		if (IsAtLimit(Ready.Num(), MaxCount))
+		{
+			break;
+		}
+
+		AVoxelChunkBase* Chunk = FindChunk(Coord);
+		if (!Chunk || Chunk->HasMesh())
+		{
+			continue;
+		}
+
+		bool bNeighboursLoaded = true;
+		for (const FIntPoint& Offset : SideOffsets)
+		{
+			bNeighboursLoaded &= Chunks.Contains(Coord + Offset);
+		}
+		if (bNeighboursLoaded)
+		{
+			Ready.Add(Chunk);
+		}
+	}
+	return Ready;
 }
 
 namespace
 {
-	/**
-	 * Added to the world seed for the worm random stream, so worms never reuse the terrain's random numbers.
-	 * 0x9E3779B9 is the usual "golden ratio" hashing constant: its bits are well mixed.
-	 */
-	constexpr uint32 WormSeedSalt = 0x9E3779B9u;
-
-	/** Distance a worm moves per step, in cubes. */
-	constexpr double WormStepLength = 1.0;
-
-	/** Tries to find a start column outside the spawn area before giving up on that worm. */
-	constexpr int32 MaxWormStartAttempts = 8;
-
-	/** Extra steps carved forward once a worm finds a cave ahead, so no thin wall is left between them. */
-	constexpr int32 WormStepsIntoCave = 2;
-
-	/** Range of each random per-worm noise offset, in cubes; gives every worm its own wiggles. */
-	constexpr double WormNoiseOffsetRange = 1000.0;
-
-	/** Perlin output sits mostly within ±0.5; this span is mapped to MinRadius..MaxRadius. */
-	constexpr double WormRadiusNoiseRange = 0.5;
-
-	// Fixed offsets so the heading, slope and radius noises are independent of each other.
-
-	/** Offset for the heading (left / right) noise. */
-	const FVector WormHeadingNoiseOffset(0.0, 0.0, 0.0);
-
-	/** Offset for the slope (up / down) noise. */
-	const FVector WormSlopeNoiseOffset(1700.0, 0.0, 0.0);
-
-	/** Offset for the radius noise. */
-	const FVector WormRadiusNoiseOffset(0.0, 2900.0, 0.0);
-
-	/** Why a worm stopped; counted for the log. */
-	enum class EWormStop : uint8
+	/** Squared distance in chunks between two chunk coordinates (no square root needed to compare). */
+	int32 ChunkDistanceSquared(const FIntPoint A, const FIntPoint B)
 	{
-		MaxSteps,
-		Bedrock,
-		LeftWorld,
-		Connected,
-		Count,
-	};
-
-	/** Cell that contains a position in cube units (cell X covers X..X+1). */
-	FIntVector PositionToCell(const FVector& Position)
-	{
-		return FIntVector(FMath::FloorToInt(Position.X), FMath::FloorToInt(Position.Y), FMath::FloorToInt(Position.Z));
-	}
-
-	/** 3D Perlin at Position × Frequency + Offset. */
-	double SampleWormNoise(const FVector& Position, const double Frequency, const FVector& Offset)
-	{
-		const FVector Sample = Position * Frequency + Offset;
-		return UVoxelNoiseLibrary::PerlinNoise3D(static_cast<float>(Sample.X), static_cast<float>(Sample.Y), static_cast<float>(Sample.Z));
+		const FIntPoint Delta = A - B;
+		return Delta.X * Delta.X + Delta.Y * Delta.Y;
 	}
 
 	/**
-	 * True when the cell is air that was there before this worm: inside a loaded chunk, at or below its column's
-	 * top (so it's a cave, not the sky) and not carved by this worm itself.
+	 * Chunks of the map further than Radius from Center that pass Filter, farthest first, at most MaxCount.
+	 * Farthest first so the chunks that matter least go first when the budget cuts the list short.
 	 */
-	bool IsExistingCaveAir(const AVoxelWorldBase& World, const FIntVector& Cell, const TSet<FIntVector>& OwnCells)
+	template <typename FilterType>
+	TArray<AVoxelChunkBase*> GetChunksOutsideFarthestFirst(const TMap<FIntPoint, TObjectPtr<AVoxelChunkBase>>& Chunks,
+		const FIntPoint Center, const int32 Radius, const int32 MaxCount, FilterType Filter)
 	{
-		const AVoxelChunkBase* Chunk = World.FindChunk(AVoxelWorldBase::CellToChunkCoord(Cell));
-		if (!Chunk || Cell.Z < 0)
+		const int32 SafeRadius = FMath::Max(Radius, 0);
+		const int32 RadiusSquared = SafeRadius * SafeRadius;
+
+		TArray<TPair<int32, AVoxelChunkBase*>> Found;
+		for (const TPair<FIntPoint, TObjectPtr<AVoxelChunkBase>>& Entry : Chunks)
 		{
-			return false;
+			const int32 DistanceSquared = ChunkDistanceSquared(Entry.Key, Center);
+			if (DistanceSquared > RadiusSquared && Entry.Value && Filter(*Entry.Value))
+			{
+				Found.Emplace(DistanceSquared, Entry.Value.Get());
+			}
 		}
 
-		const FIntVector Local = AVoxelWorldBase::CellToLocal(Cell);
-		return Cell.Z <= Chunk->GetColumnHeight(Local.X, Local.Y)
-			&& Chunk->GetLocalCubeByte(Local.X, Local.Y, Local.Z) == Voxel::CubeType::Air
-			&& !OwnCells.Contains(Cell);
-	}
-
-	/** Sets every solid cell whose centre is within Radius of Center to Air, above bedrock. Remembers what it carved. */
-	void CarveSphere(AVoxelWorldBase& World, const FVector& Center, const double Radius, const int32 BedrockLayers,
-		TSet<FIntVector>& OwnCells)
-	{
-		const FIntVector MinCell = PositionToCell(Center - FVector(Radius));
-		const FIntVector MaxCell = PositionToCell(Center + FVector(Radius));
-		const double RadiusSquared = Radius * Radius;
-
-		for (int32 Z = FMath::Max(MinCell.Z, BedrockLayers + 1); Z <= MaxCell.Z; ++Z)
+		// Ties broken by coordinate so the order never depends on the map's internal order.
+		Found.Sort([](const TPair<int32, AVoxelChunkBase*>& A, const TPair<int32, AVoxelChunkBase*>& B)
 		{
-			for (int32 Y = MinCell.Y; Y <= MaxCell.Y; ++Y)
+			if (A.Key != B.Key)
 			{
-				for (int32 X = MinCell.X; X <= MaxCell.X; ++X)
-				{
-					const FIntVector Cell(X, Y, Z);
-					const FVector CellCenter(X + 0.5, Y + 0.5, Z + 0.5);
-					if (FVector::DistSquared(CellCenter, Center) > RadiusSquared
-						|| World.GetCubeByte(Cell) == Voxel::CubeType::Air)
-					{
-						continue;
-					}
-
-					if (World.SetCubeByte(Cell, Voxel::CubeType::Air))
-					{
-						OwnCells.Add(Cell);
-					}
-				}
+				return A.Key > B.Key;
 			}
-		}
-	}
+			const FIntPoint CoordA = A.Value->GetChunkCoord();
+			const FIntPoint CoordB = B.Value->GetChunkCoord();
+			return CoordA.X != CoordB.X ? CoordA.X < CoordB.X : CoordA.Y < CoordB.Y;
+		});
 
-	/**
-	 * Walks one worm from Start and carves it. Each step: check the stop rules, steer with noise (heading wanders,
-	 * slope = DownwardBias plus noise), pick the radius from noise, look ahead for a cave, carve a sphere, move on.
-	 */
-	EWormStop CarveWorm(AVoxelWorldBase& World, FVector Position, double Heading, const FVector& NoiseOffset,
-		const FVoxelWormSettings& Worms, const int32 BedrockLayers)
-	{
-		const double StartZ = Position.Z;
-		const double MinRadius = FMath::Min(Worms.MinRadius, Worms.MaxRadius);
-		const double MaxRadius = FMath::Max(Worms.MinRadius, Worms.MaxRadius);
-		TSet<FIntVector> OwnCells;
-
-		for (int32 Step = 0; Step < Worms.MaxSteps; ++Step)
+		TArray<AVoxelChunkBase*> Result;
+		for (const TPair<int32, AVoxelChunkBase*>& Entry : Found)
 		{
-			const FIntVector Cell = PositionToCell(Position);
-			if (!World.FindChunk(AVoxelWorldBase::CellToChunkCoord(Cell)))
+			if (IsAtLimit(Result.Num(), MaxCount))
 			{
-				return EWormStop::LeftWorld;
+				break;
 			}
-			if (Cell.Z <= BedrockLayers)
-			{
-				return EWormStop::Bedrock;
-			}
-
-			// Steering. The noise is sampled at the worm's position, so it changes smoothly as the worm moves
-			// and gives gentle bends rather than random jitter.
-			const FVector NoisePosition = Position + NoiseOffset;
-			Heading += Worms.TurnStrength * SampleWormNoise(NoisePosition, Worms.TurnFrequency, WormHeadingNoiseOffset);
-			const double Drop = FMath::Clamp(
-				Worms.DownwardBias + Worms.TurnStrength * SampleWormNoise(NoisePosition, Worms.TurnFrequency, WormSlopeNoiseOffset),
-				-1.0, 1.0);
-			const double Level = FMath::Sqrt(1.0 - Drop * Drop);
-			const FVector Direction(FMath::Cos(Heading) * Level, FMath::Sin(Heading) * Level, -Drop);
-
-			const double Radius = FMath::GetMappedRangeValueClamped(
-				FVector2D(-WormRadiusNoiseRange, WormRadiusNoiseRange),
-				FVector2D(MinRadius, MaxRadius),
-				SampleWormNoise(NoisePosition, Worms.TurnFrequency, WormRadiusNoiseOffset));
-
-			// Look just past the front of this step's sphere. Air there that this worm didn't make is a real cave.
-			const bool bDeepEnough = StartZ - Position.Z >= Worms.MinDepthBeforeConnect;
-			const FIntVector Ahead = PositionToCell(Position + Direction * (Radius + 1.0));
-			if (bDeepEnough && IsExistingCaveAir(World, Ahead, OwnCells))
-			{
-				for (int32 Extra = 0; Extra <= WormStepsIntoCave; ++Extra)
-				{
-					CarveSphere(World, Position + Direction * (Extra * WormStepLength), Radius, BedrockLayers, OwnCells);
-				}
-				return EWormStop::Connected;
-			}
-
-			CarveSphere(World, Position, Radius, BedrockLayers, OwnCells);
-			Position += Direction * WormStepLength;
+			Result.Add(Entry.Value);
 		}
-		return EWormStop::MaxSteps;
+		return Result;
 	}
 }
 
-void AVoxelWorldBase::CarveWorms(const int32 Seed, const FVoxelWormSettings& Worms, const int32 BedrockLayers,
-	int32& WormsCarved, int32& WormsConnected)
+TArray<AVoxelChunkBase*> AVoxelWorldBase::GetMeshedChunksOutside(const FIntPoint Center, const int32 RadiusChunks, const int32 MaxCount) const
 {
-	// One random stream drives every choice (start columns, headings, noise offsets) in a fixed order, so the
-	// same seed and the same chunk set always give the same worms.
-	TRACE_CPUPROFILER_EVENT_SCOPE(AVoxelWorldBase::CarveWorms);
+	// Only chunks that still have something drawn; data-only chunks are already in the right state.
+	return GetChunksOutsideFarthestFirst(Chunks, Center, RadiusChunks, MaxCount,
+		[](const AVoxelChunkBase& Chunk) { return Chunk.HasMesh(); });
+}
 
-	WormsCarved = 0;
-	WormsConnected = 0;
+TArray<AVoxelChunkBase*> AVoxelWorldBase::GetChunksToUnload(const FIntPoint Center, const int32 RadiusChunks, const int32 MaxCount) const
+{
+	// Every chunk past the unload radius goes, meshed or not.
+	return GetChunksOutsideFarthestFirst(Chunks, Center, RadiusChunks, MaxCount,
+		[](const AVoxelChunkBase&) { return true; });
+}
 
-	if (!Worms.bEnabled)
+void AVoxelWorldBase::UnregisterChunk(AVoxelChunkBase* Chunk)
+{
+	// Removes by the chunk's own coordinate, and only if the map still points at this chunk.
+	if (!ensureMsgf(Chunk != nullptr, TEXT("UnregisterChunk: Chunk is None.")))
 	{
 		return;
 	}
 
-	const double StartSeconds = FPlatformTime::Seconds();
+	const FIntPoint Coord = Chunk->GetChunkCoord();
+	if (const TObjectPtr<AVoxelChunkBase>* Found = Chunks.Find(Coord); Found && *Found == Chunk)
+	{
+		Chunks.Remove(Coord);
+	}
+	Chunk->SetVoxelWorld(nullptr);
+}
 
-	// Map order follows spawn order, so sort the keys: start picks must not depend on how chunks were added.
+TArray<FIntVector> AVoxelWorldBase::FilterCellsInChunk(const TArray<FIntVector>& Cells, const FIntPoint Coord)
+{
+	// One pass over every saved edit; only this chunk's ones are returned, so Blueprint loops over a few cells.
+	TArray<FIntVector> Inside;
+	for (const FIntVector& Cell : Cells)
+	{
+		if (CellToChunkCoord(Cell) == Coord)
+		{
+			Inside.Add(Cell);
+		}
+	}
+	return Inside;
+}
+
+void AVoxelWorldBase::VerifyStandaloneGeneration(const FVoxelTerrainSettings& Terrain, const FVoxelCaveSettings& Caves,
+	const FVector NoiseOffset, const int32 BedrockLayers, const bool bEnableCaves, int32& ColumnMismatchChunks,
+	int32& InteriorMismatchChunks, int32& RimMismatchChunks)
+{
+	// For each chunk: build it again from nothing but the noise and compare byte by byte. Columns never depend
+	// on neighbours, so they must match everywhere; cubes must match wherever the old caves saw every neighbour.
+	ColumnMismatchChunks = 0;
+	InteriorMismatchChunks = 0;
+	RimMismatchChunks = 0;
+
 	TArray<FIntPoint> ChunkCoords;
 	Chunks.GenerateKeyArray(ChunkCoords);
 	ChunkCoords.Sort([](const FIntPoint& A, const FIntPoint& B) { return A.X != B.X ? A.X < B.X : A.Y < B.Y; });
 
-	if (ChunkCoords.IsEmpty())
+	// A chunk is "interior" when every chunk the cave border can reach exists, so the old path saw no gaps.
+	const int32 ReachChunks = FMath::DivideAndRoundUp(VoxelGeneration::GetColumnPadding(Caves), Voxel::ChunkSize);
+	int32 InteriorChunks = 0;
+	double GenerateSeconds = 0.0;
+
+	for (const FIntPoint& Coord : ChunkCoords)
 	{
-		UE_LOG(LogVoxel, Warning, TEXT("CarveWorms: no chunks registered, nothing to carve."));
-		return;
-	}
+		const AVoxelChunkBase* Chunk = FindChunk(Coord);
+		const FVoxelChunkData& Existing = Chunk->GetChunkData();
 
-	FRandomStream Stream(static_cast<int32>(static_cast<uint32>(Seed) + WormSeedSalt));
-	const int32 WormCount = FMath::RoundToInt(ChunkCoords.Num() * FMath::Max(Worms.WormsPerChunk, 0.0));
-	const int64 SpawnClearSquared = static_cast<int64>(Worms.SpawnClearRadius) * Worms.SpawnClearRadius;
+		FVoxelGenerationParams Params;
+		Params.Terrain = Terrain;
+		Params.Caves = Caves;
+		Params.NoiseOffset = NoiseOffset;
+		Params.WorldHeight = Existing.WorldHeight;
+		Params.BedrockLayers = BedrockLayers;
+		Params.bEnableCaves = bEnableCaves;
 
-	int32 SkippedStarts = 0;
-	int32 StopCounts[static_cast<int32>(EWormStop::Count)] = {};
+		const double StartSeconds = FPlatformTime::Seconds();
+		const FVoxelChunkData Generated = VoxelGeneration::GenerateChunk(Coord, Params);
+		GenerateSeconds += FPlatformTime::Seconds() - StartSeconds;
 
-	for (int32 WormIndex = 0; WormIndex < WormCount; ++WormIndex)
-	{
-		// Start column: random chunk, random column, retried a few times if it lands in the spawn area.
-		bool bFoundStart = false;
-		FVector Start = FVector::ZeroVector;
-
-		for (int32 Attempt = 0; Attempt < MaxWormStartAttempts && !bFoundStart; ++Attempt)
+		bool bInterior = true;
+		for (int32 OffsetY = -ReachChunks; OffsetY <= ReachChunks && bInterior; ++OffsetY)
 		{
-			const FIntPoint ChunkCoord = ChunkCoords[Stream.RandRange(0, ChunkCoords.Num() - 1)];
-			const int32 LocalX = Stream.RandRange(0, Voxel::ChunkSize - 1);
-			const int32 LocalY = Stream.RandRange(0, Voxel::ChunkSize - 1);
-			const int32 CellX = ChunkCoord.X * Voxel::ChunkSize + LocalX;
-			const int32 CellY = ChunkCoord.Y * Voxel::ChunkSize + LocalY;
-
-			if (static_cast<int64>(CellX) * CellX + static_cast<int64>(CellY) * CellY < SpawnClearSquared)
+			for (int32 OffsetX = -ReachChunks; OffsetX <= ReachChunks && bInterior; ++OffsetX)
 			{
-				continue;
+				bInterior = FindChunk(Coord + FIntPoint(OffsetX, OffsetY)) != nullptr;
 			}
+		}
+		InteriorChunks += bInterior ? 1 : 0;
 
-			const int32 Height = FindChunk(ChunkCoord)->GetColumnHeight(LocalX, LocalY);
-			if (Height == INDEX_NONE)
+		const bool bColumnsMatch = Generated.Heights == Existing.Heights
+			&& Generated.GrassDepths == Existing.GrassDepths
+			&& Generated.SnowLines == Existing.SnowLines;
+
+		int32 CubeMismatches = 0;
+		if (Generated.Cubes.Num() == Existing.Cubes.Num())
+		{
+			for (int32 Index = 0; Index < Generated.Cubes.Num(); ++Index)
 			{
-				continue;
+				CubeMismatches += Generated.Cubes[Index] != Existing.Cubes[Index] ? 1 : 0;
 			}
-
-			// Centre of the column's top cube, in cube units.
-			Start = FVector(CellX + 0.5, CellY + 0.5, Height + 0.5);
-			bFoundStart = true;
+		}
+		else
+		{
+			CubeMismatches = FMath::Max(Generated.Cubes.Num(), Existing.Cubes.Num());
 		}
 
-		// Drawn even for skipped worms, in the same order every time, so the sequence stays reproducible.
-		const double Heading = Stream.FRandRange(0.0, UE_TWO_PI);
-		const FVector NoiseOffset(
-			Stream.FRandRange(-WormNoiseOffsetRange, WormNoiseOffsetRange),
-			Stream.FRandRange(-WormNoiseOffsetRange, WormNoiseOffsetRange),
-			Stream.FRandRange(-WormNoiseOffsetRange, WormNoiseOffsetRange));
-
-		if (!bFoundStart)
+		if (!bColumnsMatch)
 		{
-			++SkippedStarts;
-			continue;
+			++ColumnMismatchChunks;
+			UE_LOG(LogVoxel, Warning, TEXT("VerifyStandaloneGeneration: chunk (%d, %d) columns differ."), Coord.X, Coord.Y);
 		}
-
-		const EWormStop Stop = CarveWorm(*this, Start, Heading, NoiseOffset, Worms, BedrockLayers);
-		++StopCounts[static_cast<int32>(Stop)];
-		++WormsCarved;
+		if (CubeMismatches > 0)
+		{
+			(bInterior ? InteriorMismatchChunks : RimMismatchChunks) += 1;
+			UE_LOG(LogVoxel, Log, TEXT("VerifyStandaloneGeneration: chunk (%d, %d) [%s] %d cubes differ."),
+				Coord.X, Coord.Y, bInterior ? TEXT("interior") : TEXT("rim"), CubeMismatches);
+		}
 	}
 
-	WormsConnected = StopCounts[static_cast<int32>(EWormStop::Connected)];
-	const double ElapsedMs = (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
-
+	const int32 ChunkCount = ChunkCoords.Num();
 	UE_LOG(LogVoxel, Log,
-		TEXT("CarveWorms: %d worms carved, %d connected to a cave (others stopped: %d bedrock, %d world edge, %d max steps; %d starts skipped near spawn) in %.2f ms."),
-		WormsCarved, WormsConnected,
-		StopCounts[static_cast<int32>(EWormStop::Bedrock)],
-		StopCounts[static_cast<int32>(EWormStop::LeftWorld)],
-		StopCounts[static_cast<int32>(EWormStop::MaxSteps)],
-		SkippedStarts, ElapsedMs);
+		TEXT("VerifyStandaloneGeneration: %d chunks. Columns differ in %d. Cubes differ in %d of %d interior and %d of %d rim chunks. GenerateChunk avg %.2f ms."),
+		ChunkCount, ColumnMismatchChunks, InteriorMismatchChunks, InteriorChunks, RimMismatchChunks, ChunkCount - InteriorChunks,
+		ChunkCount > 0 ? GenerateSeconds * 1000.0 / ChunkCount : 0.0);
+}
+
+namespace
+{
+	/** Floor division, so chunk −1 is in region −1, not region 0. */
+	int32 FloorDivRegion(const int32 Value, const int32 Divisor)
+	{
+		return Value >= 0 ? Value / Divisor : -((-Value + Divisor - 1) / Divisor);
+	}
+
+	/** Squared distance in chunks from a chunk to the nearest chunk of a region (0 when inside it). */
+	int64 RegionDistanceSquared(const FIntPoint Center, const FIntPoint Region, const int32 RegionSizeChunks)
+	{
+		const int32 MinX = Region.X * RegionSizeChunks;
+		const int32 MinY = Region.Y * RegionSizeChunks;
+		const int64 DeltaX = FMath::Max3(MinX - Center.X, 0, Center.X - (MinX + RegionSizeChunks - 1));
+		const int64 DeltaY = FMath::Max3(MinY - Center.Y, 0, Center.Y - (MinY + RegionSizeChunks - 1));
+		return DeltaX * DeltaX + DeltaY * DeltaY;
+	}
+}
+
+void AVoxelWorldBase::SetGenerationParams(const int32 Seed, const FVoxelTerrainSettings& Terrain, const FVoxelCaveSettings& Caves,
+	const FVoxelWormSettings& Worms, const FVector NoiseOffset, const int32 WorldHeight, const int32 BedrockLayers, const bool bEnableCaves)
+{
+	// A copy of everything the planner reads, so planning never touches the data asset or an actor.
+	WormParams = FVoxelWormPlanParams();
+	WormParams.Seed = Seed;
+	WormParams.Worms = Worms;
+	WormParams.Generation.Terrain = Terrain;
+	WormParams.Generation.Caves = Caves;
+	WormParams.Generation.NoiseOffset = NoiseOffset;
+	WormParams.Generation.WorldHeight = WorldHeight;
+	WormParams.Generation.BedrockLayers = BedrockLayers;
+	WormParams.Generation.bEnableCaves = bEnableCaves;
+	bHasGenerationParams = true;
+
+	// Plans made with other inputs would carve the wrong tunnels.
+	WormRegions.Reset();
+}
+
+int32 AVoxelWorldBase::GetWormReachChunks() const
+{
+	// Whole chunks a worm can reach from its region, plus one so a sphere spilling into the next chunk counts.
+	return FMath::DivideAndRoundUp(VoxelWorms::GetMaxReachCubes(WormParams.Worms), Voxel::ChunkSize) + 1;
+}
+
+TArray<FIntPoint> AVoxelWorldBase::GetWormRegionsNeededNear(const FIntPoint Center, const int32 RadiusChunks) const
+{
+	// A region matters if any chunk within RadiusChunks could be reached by its worms.
+	const int32 RegionSize = FMath::Max(WormParams.Worms.RegionSizeChunks, 1);
+	const int32 Reach = FMath::Max(RadiusChunks, 0) + GetWormReachChunks();
+	const int64 ReachSquared = static_cast<int64>(Reach) * Reach;
+
+	TArray<TPair<int64, FIntPoint>> Found;
+	for (int32 RegionY = FloorDivRegion(Center.Y - Reach, RegionSize); RegionY <= FloorDivRegion(Center.Y + Reach, RegionSize); ++RegionY)
+	{
+		for (int32 RegionX = FloorDivRegion(Center.X - Reach, RegionSize); RegionX <= FloorDivRegion(Center.X + Reach, RegionSize); ++RegionX)
+		{
+			const FIntPoint Region(RegionX, RegionY);
+			const int64 DistanceSquared = RegionDistanceSquared(Center, Region, RegionSize);
+			if (DistanceSquared <= ReachSquared)
+			{
+				Found.Emplace(DistanceSquared, Region);
+			}
+		}
+	}
+
+	// Nearest first; ties by coordinate so the order only depends on the inputs.
+	Found.Sort([](const TPair<int64, FIntPoint>& A, const TPair<int64, FIntPoint>& B)
+	{
+		if (A.Key != B.Key)
+		{
+			return A.Key < B.Key;
+		}
+		return A.Value.X != B.Value.X ? A.Value.X < B.Value.X : A.Value.Y < B.Value.Y;
+	});
+
+	TArray<FIntPoint> Regions;
+	Regions.Reserve(Found.Num());
+	for (const TPair<int64, FIntPoint>& Entry : Found)
+	{
+		Regions.Add(Entry.Value);
+	}
+	return Regions;
+}
+
+const TArray<FVoxelWormPath>& AVoxelWorldBase::FindOrPlanWormRegion(const FIntPoint Region)
+{
+	if (const TArray<FVoxelWormPath>* Found = WormRegions.Find(Region))
+	{
+		return *Found;
+	}
+	return WormRegions.Add(Region, VoxelWorms::PlanRegion(Region, WormParams));
+}
+
+int32 AVoxelWorldBase::CarveWormsInChunk(AVoxelChunkBase* Chunk)
+{
+	// Plan first, then collect: adding regions to the map while holding pointers into it would be unsafe.
+	TRACE_CPUPROFILER_EVENT_SCOPE(AVoxelWorldBase::CarveWormsInChunk);
+
+	if (!ensureMsgf(Chunk != nullptr, TEXT("CarveWormsInChunk: Chunk is None."))
+		|| !ensureMsgf(bHasGenerationParams, TEXT("CarveWormsInChunk: call SetGenerationParams first."))
+		|| !WormParams.Worms.bEnabled)
+	{
+		return 0;
+	}
+
+	const TArray<FIntPoint> Regions = GetWormRegionsNeededNear(Chunk->GetChunkCoord(), 0);
+	for (const FIntPoint& Region : Regions)
+	{
+		FindOrPlanWormRegion(Region);
+	}
+
+	TArray<const FVoxelWormPath*> Paths;
+	for (const FIntPoint& Region : Regions)
+	{
+		for (const FVoxelWormPath& Path : WormRegions.FindChecked(Region))
+		{
+			Paths.Add(&Path);
+		}
+	}
+
+	return VoxelWorms::CarveIntoChunk(Paths, Chunk->GetChunkCoord(), WormParams.Generation.BedrockLayers, Chunk->GetMutableChunkData());
+}
+
+int32 AVoxelWorldBase::PlanWormRegionsNear(const FIntPoint Center, const int32 LoadRadiusChunks, const int32 MaxRegions)
+{
+	// One region further out than the chunks need, so a region is ready long before the first chunk asks for it.
+	if (!bHasGenerationParams || !WormParams.Worms.bEnabled)
+	{
+		return 0;
+	}
+
+	const double StartSeconds = FPlatformTime::Seconds();
+	const int32 AheadRadius = FMath::Max(LoadRadiusChunks, 0) + FMath::Max(WormParams.Worms.RegionSizeChunks, 1);
+
+	int32 Planned = 0;
+	for (const FIntPoint& Region : GetWormRegionsNeededNear(Center, AheadRadius))
+	{
+		if (IsAtLimit(Planned, MaxRegions))
+		{
+			break;
+		}
+		if (!WormRegions.Contains(Region))
+		{
+			WormRegions.Add(Region, VoxelWorms::PlanRegion(Region, WormParams));
+			++Planned;
+		}
+	}
+
+	if (Planned > 0)
+	{
+		UE_LOG(LogVoxel, Verbose, TEXT("PlanWormRegionsNear: planned %d regions in %.2f ms (%d cached)."),
+			Planned, (FPlatformTime::Seconds() - StartSeconds) * 1000.0, WormRegions.Num());
+	}
+	return Planned;
+}
+
+int32 AVoxelWorldBase::EvictWormRegionsFar(const FIntPoint Center, const int32 UnloadRadiusChunks)
+{
+	// Keep a margin of two regions beyond what PlanWormRegionsNear plans, so a region isn't dropped and replanned
+	// when the player steps back and forth.
+	const int32 RegionSize = FMath::Max(WormParams.Worms.RegionSizeChunks, 1);
+	const int32 Keep = FMath::Max(UnloadRadiusChunks, 0) + GetWormReachChunks() + 2 * RegionSize;
+	const int64 KeepSquared = static_cast<int64>(Keep) * Keep;
+
+	int32 Evicted = 0;
+	for (auto It = WormRegions.CreateIterator(); It; ++It)
+	{
+		if (RegionDistanceSquared(Center, It.Key(), RegionSize) > KeepSquared)
+		{
+			It.RemoveCurrent();
+			++Evicted;
+		}
+	}
+	return Evicted;
 }

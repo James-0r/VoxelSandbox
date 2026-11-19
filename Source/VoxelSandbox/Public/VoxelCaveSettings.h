@@ -54,8 +54,10 @@ struct VOXELSANDBOX_API FVoxelCaveSettings
 };
 
 /**
- * Tunables for AVoxelWorldBase::CarveWorms: a few winding tunnels that start at the surface, head down and stop
- * when they break into an existing cave. Distances are in cubes, so CubeSize does not change worm sizes.
+ * Tunables for the worm tunnels (VoxelWorms): a few winding tunnels that start at the surface, head down and stop
+ * when they break into a cave. Worms are planned per region of RegionSizeChunks × RegionSizeChunks chunks from the
+ * seed alone, so they're the same whatever order chunks load in. Distances are in cubes, so CubeSize does not
+ * change worm sizes.
  */
 USTRUCT(BlueprintType)
 struct VOXELSANDBOX_API FVoxelWormSettings
@@ -63,12 +65,16 @@ struct VOXELSANDBOX_API FVoxelWormSettings
 	GENERATED_BODY()
 
 	/** Turns the worm pass on or off. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worms", meta = (ToolTip = "Turns the worm pass on or off. Off = CarveWorms does nothing."))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worms", meta = (ToolTip = "Turns the worm tunnels on or off. Off = no regions are planned and CarveWormsInChunk does nothing."))
 	bool bEnabled = true;
 
-	/** Average worms per chunk. Total worms = round(chunk count × this). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worms", meta = (ClampMin = "0.0", ToolTip = "Average worms per chunk. Total worms = round(chunk count × this), so 0.3 on 100 chunks = 30 worms. Lower = fewer cave entrances."))
+	/** Average worms per chunk. Each region gets RegionSizeChunks² × this worms on average. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worms", meta = (ClampMin = "0.0", ToolTip = "Average worms per chunk. Each region gets RegionSizeChunks² × this on average (0.3 × 16 = 4.8: four or five worms, picked by the region's seed). Lower = fewer cave entrances."))
 	double WormsPerChunk = 0.3;
+
+	/** Side of a worm planning region, in chunks. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worms", meta = (ClampMin = "1", ToolTip = "Worms are planned per square region of this many chunks a side, each from its own seed. Bigger = fewer, larger planning jobs. Changing it changes where worms are."))
+	int32 RegionSizeChunks = 4;
 
 	/** Narrowest tunnel radius, in cubes. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worms|Shape", meta = (ClampMin = "0.5", ToolTip = "Narrowest tunnel radius, in cubes. Below about 1.5 the player can't fit through. The radius drifts smoothly between Min and Max along each worm."))
@@ -79,7 +85,7 @@ struct VOXELSANDBOX_API FVoxelWormSettings
 	double MaxRadius = 3.0;
 
 	/** Longest a worm can get, in steps of one cube. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worms|Shape", meta = (ClampMin = "1", ToolTip = "Longest a worm can get, in steps of one cube. A worm usually stops earlier, when it reaches a cave, bedrock or the edge of the world."))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Worms|Shape", meta = (ClampMin = "1", ToolTip = "Longest a worm can get, in steps of one cube. A worm usually stops earlier, when it reaches a cave or bedrock. This also sets how far a worm can reach from its region, so how many regions each chunk must check: lower = cheaper."))
 	int32 MaxSteps = 250;
 
 	/** How steeply worms head down: 0 = level, 1 = straight down. */
